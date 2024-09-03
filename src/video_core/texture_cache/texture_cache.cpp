@@ -35,13 +35,15 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 TextureCache::~TextureCache() = default;
 
 void TextureCache::InvalidateMemory(VAddr address, size_t size) {
+    static constexpr size_t MaxInvalidateDist = 128_MB;
     std::unique_lock lock{mutex};
     ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
-        if (!image.Overlaps(address, size)) {
-            return;
+        const size_t image_dist =
+            image.cpu_addr > address ? image.cpu_addr - address : address - image.cpu_addr;
+        if (image_dist < MaxInvalidateDist && image.info.size.width != 1) {
+            // Ensure image is reuploaded when accessed again.
+            image.flags |= ImageFlagBits::CpuModified;
         }
-        // Ensure image is reuploaded when accessed again.
-        image.flags |= ImageFlagBits::CpuModified;
         // Untrack image, so the range is unprotected and the guest can write freely.
         UntrackImage(image, image_id);
     });
@@ -63,7 +65,7 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     }
 }
 
-ImageId TextureCache::FindImage(const ImageInfo& info) {
+ImageId TextureCache::FindImage(const ImageInfo& info, FindFlags flags) {
     if (info.guest_address == 0) [[unlikely]] {
         return NULL_IMAGE_VIEW_ID;
     }
@@ -72,18 +74,22 @@ ImageId TextureCache::FindImage(const ImageInfo& info) {
     boost::container::small_vector<ImageId, 2> image_ids;
     ForEachImageInRegion(
         info.guest_address, info.guest_size_bytes, [&](ImageId image_id, Image& image) {
-            // Address and width must match.
-            if (image.cpu_addr != info.guest_address || image.info.size.width != info.size.width) {
+            if (image.cpu_addr != info.guest_address) {
                 return;
             }
-            if (info.IsDepthStencil() != image.info.IsDepthStencil() &&
-                info.pixel_format != vk::Format::eR32Sfloat) {
+            if (True(flags & FindFlags::FullOverlap) &&
+                image.info.guest_size_bytes > info.guest_size_bytes) {
+                return;
+            }
+            if (False(flags & FindFlags::RelaxDim) && image.info.size.width != info.size.width) {
                 return;
             }
             image_ids.push_back(image_id);
         });
 
-    // ASSERT_MSG(image_ids.size() <= 1, "Overlapping images not allowed!");
+    if (True(flags & FindFlags::NoCreate) && image_ids.empty()) {
+        return {};
+    }
 
     ImageId image_id{};
     if (image_ids.empty()) {
@@ -229,6 +235,10 @@ ImageView& TextureCache::FindDepthTarget(const ImageInfo& image_info,
 }
 
 void TextureCache::RefreshImage(Image& image, Vulkan::Scheduler* custom_scheduler /*= nullptr*/) {
+    if (False(image.flags & ImageFlagBits::CpuModified)) {
+        return;
+    }
+
     // Mark image as validated.
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -260,7 +270,7 @@ void TextureCache::RefreshImage(Image& image, Vulkan::Scheduler* custom_schedule
             .bufferRowLength = static_cast<u32>(mip_pitch),
             .bufferImageHeight = static_cast<u32>(mip_height),
             .imageSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
                 .mipLevel = m,
                 .baseArrayLayer = 0,
                 .layerCount = num_layers,
@@ -282,15 +292,8 @@ void TextureCache::RefreshImage(Image& image, Vulkan::Scheduler* custom_schedule
 
     const VAddr image_addr = image.info.guest_address;
     const size_t image_size = image.info.guest_size_bytes;
-    vk::Buffer buffer{};
-    u32 offset{};
-    if (auto upload_buffer = tile_manager.TryDetile(image); upload_buffer) {
-        buffer = *upload_buffer;
-    } else {
-        const auto [vk_buffer, buf_offset] = buffer_cache.ObtainTempBuffer(image_addr, image_size);
-        buffer = vk_buffer->Handle();
-        offset = buf_offset;
-    }
+    const auto [vk_buffer, buf_offset] = buffer_cache.ObtainTempBuffer(image_addr, image_size);
+    const auto [buffer, offset] = tile_manager.TryDetile(vk_buffer->Handle(), buf_offset, image);
 
     for (auto& copy : image_copy) {
         copy.bufferOffset += offset;

@@ -23,6 +23,13 @@ namespace VideoCore {
 class BufferCache;
 class PageManager;
 
+enum class FindFlags {
+    NoCreate = 1 << 0,    ///< Do not create an image if searching for one fails.
+    RelaxDim = 1 << 1,    ///< Do not check the dimentions of image, only address.
+    FullOverlap = 1 << 2, ///< Check that the image is entirely contained in the range.
+};
+DECLARE_ENUM_FLAG_OPERATORS(FindFlags)
+
 class TextureCache {
     struct Traits {
         using Entry = boost::container::small_vector<ImageId, 16>;
@@ -44,7 +51,7 @@ public:
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
     /// Retrieves the image handle of the image with the provided attributes.
-    [[nodiscard]] ImageId FindImage(const ImageInfo& info);
+    [[nodiscard]] ImageId FindImage(const ImageInfo& info, FindFlags flags = {});
 
     /// Retrieves an image view with the properties of the specified image descriptor.
     [[nodiscard]] ImageView& FindTexture(const ImageInfo& image_info,
@@ -61,11 +68,8 @@ public:
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id, Vulkan::Scheduler* custom_scheduler = nullptr) {
         Image& image = slot_images[image_id];
-        if (False(image.flags & ImageFlagBits::CpuModified)) {
-            return;
-        }
-        RefreshImage(image, custom_scheduler);
         TrackImage(image, image_id);
+        RefreshImage(image, custom_scheduler);
     }
 
     /// Reuploads image contents.
@@ -124,7 +128,7 @@ private:
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
         static constexpr bool BOOL_BREAK = std::is_same_v<FuncReturn, bool>;
         boost::container::small_vector<ImageId, 32> images;
-        ForEachPage(cpu_addr, size, [this, &images, func](u64 page) {
+        ForEachPage(cpu_addr, size, [this, &images, cpu_addr, size, func](u64 page) {
             const auto it = page_table.find(page);
             if (it == nullptr) {
                 if constexpr (BOOL_BREAK) {
@@ -136,6 +140,9 @@ private:
             for (const ImageId image_id : *it) {
                 Image& image = slot_images[image_id];
                 if (image.flags & ImageFlagBits::Picked) {
+                    continue;
+                }
+                if (!image.Overlaps(cpu_addr, size)) {
                     continue;
                 }
                 image.flags |= ImageFlagBits::Picked;
