@@ -73,7 +73,7 @@ int PS4_SYSV_ABI sceMsgDialogTerminate() {
 
 int PS4_SYSV_ABI sceMsgDialogUpdateStatus() {
     LOG_ERROR(Lib_MsgDlg, "(STUBBED) called");
-    return ORBIS_OK;
+    return 3;
 }
 
 void RegisterlibSceMsgDialog(Core::Loader::SymbolsResolver* sym) {
